@@ -13,6 +13,7 @@ import (
 	"github.com/rakshit9/llmrelay/internal/config"
 	"github.com/rakshit9/llmrelay/internal/middleware"
 	"github.com/rakshit9/llmrelay/internal/observability"
+	"github.com/rakshit9/llmrelay/internal/router"
 	"github.com/rakshit9/llmrelay/internal/upstream"
 )
 
@@ -26,30 +27,37 @@ func main() {
 		os.Exit(1)
 	}
 
-	openai := upstream.NewOpenAIClient(cfg.OpenAIAPIKey)
+	// Register all configured providers
+	providers := map[string]upstream.Provider{
+		"openai": upstream.NewOpenAIProvider(cfg.OpenAIAPIKey),
+	}
+	if cfg.AnthropicAPIKey != "" {
+		providers["anthropic"] = upstream.NewAnthropicProvider(cfg.AnthropicAPIKey)
+	}
+	if cfg.GoogleAPIKey != "" {
+		providers["google"] = upstream.NewGoogleProvider(cfg.GoogleAPIKey)
+	}
+	if cfg.GroqAPIKey != "" {
+		providers["groq"] = upstream.NewGroqProvider(cfg.GroqAPIKey)
+	}
 
-	// Global middleware applied to every request
-	global := middleware.Chain(
-		middleware.RequestID,
-		middleware.Logger,
-	)
+	rtr := router.New(providers)
 
+	global := middleware.Chain(middleware.RequestID, middleware.Logger)
 	requireAuth := auth.Require(cfg.GatewayAPIKey)
 
 	mux := http.NewServeMux()
 
-	// Public endpoints
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
-	// Prometheus metrics scrape endpoint
 	mux.Handle("GET /metrics", promhttp.Handler())
 
-	// Protected: chat completions
 	mux.Handle("POST /v1/chat/completions", requireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		requestID := middleware.GetRequestID(r.Context())
 
 		var req upstream.ChatRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -60,9 +68,6 @@ func main() {
 			writeError(w, http.StatusBadRequest, "model and messages are required")
 			return
 		}
-
-		requestID := middleware.GetRequestID(r.Context())
-		provider := "openai"
 
 		// Streaming path
 		if req.Stream {
@@ -76,7 +81,7 @@ func main() {
 				return
 			}
 
-			err := openai.ChatCompletionStream(&req, w, flusher.Flush)
+			provider, err := rtr.Stream(&req, w, flusher.Flush)
 			latency := time.Since(start).Seconds()
 
 			status := "200"
@@ -91,21 +96,16 @@ func main() {
 		}
 
 		// Non-streaming path
-		resp, statusCode, err := openai.ChatCompletion(&req)
+		resp, provider, err := rtr.Complete(&req)
 		latency := time.Since(start).Seconds()
 
 		if err != nil {
-			slog.Error("upstream error",
-				"request_id", requestID,
-				"err", err,
-				"status", statusCode,
-			)
-			observability.RequestsTotal.WithLabelValues(req.Model, provider, strconv.Itoa(statusCode)).Inc()
+			slog.Error("upstream error", "request_id", requestID, "err", err)
+			observability.RequestsTotal.WithLabelValues(req.Model, "", strconv.Itoa(http.StatusBadGateway)).Inc()
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
 
-		// Record metrics
 		observability.RequestsTotal.WithLabelValues(req.Model, provider, "200").Inc()
 		observability.RequestDuration.WithLabelValues(req.Model, provider).Observe(latency)
 		observability.TokensTotal.WithLabelValues(req.Model, provider, "prompt").Add(float64(resp.Usage.PromptTokens))
@@ -114,6 +114,7 @@ func main() {
 		slog.Info("chat complete",
 			"request_id", requestID,
 			"model", resp.Model,
+			"provider", provider,
 			"prompt_tokens", resp.Usage.PromptTokens,
 			"completion_tokens", resp.Usage.CompletionTokens,
 			"latency_ms", time.Since(start).Milliseconds(),
