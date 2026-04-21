@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -59,7 +60,9 @@ func NewOpenAIClient(apiKey string) *OpenAIClient {
 	}
 }
 
+// ChatCompletion sends a non-streaming request and returns the full response.
 func (c *OpenAIClient) ChatCompletion(req *ChatRequest) (*ChatResponse, int, error) {
+	req.Stream = false
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("marshal request: %w", err)
@@ -69,7 +72,6 @@ func (c *OpenAIClient) ChatCompletion(req *ChatRequest) (*ChatResponse, int, err
 	if err != nil {
 		return nil, 0, fmt.Errorf("build request: %w", err)
 	}
-
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 
@@ -84,7 +86,6 @@ func (c *OpenAIClient) ChatCompletion(req *ChatRequest) (*ChatResponse, int, err
 		return nil, resp.StatusCode, fmt.Errorf("read response: %w", err)
 	}
 
-	// Non-2xx: forward the raw error body back to the caller
 	if resp.StatusCode >= 400 {
 		return nil, resp.StatusCode, fmt.Errorf("%s", respBody)
 	}
@@ -95,4 +96,51 @@ func (c *OpenAIClient) ChatCompletion(req *ChatRequest) (*ChatResponse, int, err
 	}
 
 	return &chatResp, resp.StatusCode, nil
+}
+
+// ChatCompletionStream forwards the SSE stream from OpenAI directly to the client writer.
+// The writer must implement http.Flusher for real-time streaming.
+func (c *OpenAIClient) ChatCompletionStream(req *ChatRequest, w io.Writer, flush func()) error {
+	req.Stream = true
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	// Streaming needs no timeout on the outer client — use a separate client
+	streamClient := &http.Client{Timeout: 0}
+
+	httpReq, err := http.NewRequest("POST", openAIBaseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := streamClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("call openai: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("upstream error %d: %s", resp.StatusCode, b)
+	}
+
+	// Read line by line and forward each SSE chunk immediately
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			// SSE uses blank lines as chunk separators — preserve them
+			fmt.Fprintf(w, "\n")
+			flush()
+			continue
+		}
+		fmt.Fprintf(w, "%s\n", line)
+		flush()
+	}
+
+	return scanner.Err()
 }

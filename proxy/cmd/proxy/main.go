@@ -5,9 +5,14 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rakshit9/llmrelay/internal/auth"
 	"github.com/rakshit9/llmrelay/internal/config"
+	"github.com/rakshit9/llmrelay/internal/middleware"
+	"github.com/rakshit9/llmrelay/internal/observability"
 	"github.com/rakshit9/llmrelay/internal/upstream"
 )
 
@@ -22,55 +27,106 @@ func main() {
 	}
 
 	openai := upstream.NewOpenAIClient(cfg.OpenAIAPIKey)
+
+	// Global middleware applied to every request
+	global := middleware.Chain(
+		middleware.RequestID,
+		middleware.Logger,
+	)
+
 	requireAuth := auth.Require(cfg.GatewayAPIKey)
 
 	mux := http.NewServeMux()
 
-	// Public — no auth needed
+	// Public endpoints
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
-	// Protected — clients must send Authorization: Bearer <GATEWAY_API_KEY>
+	// Prometheus metrics scrape endpoint
+	mux.Handle("GET /metrics", promhttp.Handler())
+
+	// Protected: chat completions
 	mux.Handle("POST /v1/chat/completions", requireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Parse the incoming request body
+		start := time.Now()
+
 		var req upstream.ChatRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid request body")
 			return
 		}
-
 		if req.Model == "" || len(req.Messages) == 0 {
 			writeError(w, http.StatusBadRequest, "model and messages are required")
 			return
 		}
 
-		slog.Info("chat request", "model", req.Model, "messages", len(req.Messages))
+		requestID := middleware.GetRequestID(r.Context())
+		provider := "openai"
 
-		// Forward to OpenAI
+		// Streaming path
+		if req.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				writeError(w, http.StatusInternalServerError, "streaming not supported")
+				return
+			}
+
+			err := openai.ChatCompletionStream(&req, w, flusher.Flush)
+			latency := time.Since(start).Seconds()
+
+			status := "200"
+			if err != nil {
+				slog.Error("stream error", "request_id", requestID, "err", err)
+				status = "502"
+			}
+
+			observability.RequestsTotal.WithLabelValues(req.Model, provider, status).Inc()
+			observability.RequestDuration.WithLabelValues(req.Model, provider).Observe(latency)
+			return
+		}
+
+		// Non-streaming path
 		resp, statusCode, err := openai.ChatCompletion(&req)
+		latency := time.Since(start).Seconds()
+
 		if err != nil {
-			slog.Error("upstream error", "err", err, "status", statusCode)
+			slog.Error("upstream error",
+				"request_id", requestID,
+				"err", err,
+				"status", statusCode,
+			)
+			observability.RequestsTotal.WithLabelValues(req.Model, provider, strconv.Itoa(statusCode)).Inc()
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
 
-		slog.Info("chat response",
+		// Record metrics
+		observability.RequestsTotal.WithLabelValues(req.Model, provider, "200").Inc()
+		observability.RequestDuration.WithLabelValues(req.Model, provider).Observe(latency)
+		observability.TokensTotal.WithLabelValues(req.Model, provider, "prompt").Add(float64(resp.Usage.PromptTokens))
+		observability.TokensTotal.WithLabelValues(req.Model, provider, "completion").Add(float64(resp.Usage.CompletionTokens))
+
+		slog.Info("chat complete",
+			"request_id", requestID,
 			"model", resp.Model,
 			"prompt_tokens", resp.Usage.PromptTokens,
 			"completion_tokens", resp.Usage.CompletionTokens,
+			"latency_ms", time.Since(start).Milliseconds(),
 		)
 
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(statusCode)
 		json.NewEncoder(w).Encode(resp)
 	})))
 
 	addr := ":" + cfg.Port
 	slog.Info("proxy starting", "addr", addr)
 
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := http.ListenAndServe(addr, global(mux)); err != nil {
 		slog.Error("server failed", "err", err)
 		os.Exit(1)
 	}
