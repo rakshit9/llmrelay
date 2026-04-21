@@ -12,6 +12,8 @@ type Config struct {
 	AnthropicAPIKey  string
 	GoogleAPIKey     string
 	GroqAPIKey       string
+	RedisAddr        string
+	DatabaseURL      string
 }
 
 func Load() (*Config, error) {
@@ -22,6 +24,8 @@ func Load() (*Config, error) {
 		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
 		GoogleAPIKey:    os.Getenv("GOOGLE_API_KEY"),
 		GroqAPIKey:      os.Getenv("GROQ_API_KEY"),
+		RedisAddr:       getEnv("REDIS_ADDR", "localhost:6379"),
+		DatabaseURL:     getEnv("DATABASE_URL", "postgres://llmrelay:llmrelay@localhost:5432/llmrelay"),
 	}
 
 	if cfg.GatewayAPIKey == "" {

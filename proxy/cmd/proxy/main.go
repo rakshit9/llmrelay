@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -8,8 +9,10 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rakshit9/llmrelay/internal/auth"
+	"github.com/rakshit9/llmrelay/internal/cache"
 	"github.com/rakshit9/llmrelay/internal/config"
 	"github.com/rakshit9/llmrelay/internal/middleware"
 	"github.com/rakshit9/llmrelay/internal/observability"
@@ -27,7 +30,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Register all configured providers
+	// Connect to Postgres
+	pool, err := pgxpool.New(context.Background(), cfg.DatabaseURL)
+	if err != nil {
+		slog.Error("postgres connect error", "err", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	// Build cache layer
+	exactCache := cache.NewExactCache(cfg.RedisAddr)
+	if err := exactCache.Ping(context.Background()); err != nil {
+		slog.Warn("redis unavailable — exact cache disabled", "err", err)
+	}
+	semanticCache := cache.NewSemanticCache(pool)
+	cacheLayer := cache.New(exactCache, semanticCache)
+
+	// Register providers
 	providers := map[string]upstream.Provider{
 		"openai": upstream.NewOpenAIProvider(cfg.OpenAIAPIKey),
 	}
@@ -69,7 +88,7 @@ func main() {
 			return
 		}
 
-		// Streaming path
+		// Streaming: skip cache (can't cache a stream)
 		if req.Stream {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
@@ -95,7 +114,28 @@ func main() {
 			return
 		}
 
-		// Non-streaming path
+		// Non-streaming: check cache first
+		hit := cacheLayer.Get(r.Context(), &req)
+		if hit.HitType != cache.HitMiss {
+			latency := time.Since(start).Seconds()
+			observability.RequestsTotal.WithLabelValues(req.Model, string(hit.HitType), "200").Inc()
+			observability.RequestDuration.WithLabelValues(req.Model, string(hit.HitType)).Observe(latency)
+			observability.CacheHitsTotal.WithLabelValues(string(hit.HitType)).Inc()
+
+			slog.Info("cache hit",
+				"request_id", requestID,
+				"type", hit.HitType,
+				"model", req.Model,
+				"latency_ms", time.Since(start).Milliseconds(),
+			)
+
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Cache", string(hit.HitType))
+			json.NewEncoder(w).Encode(hit.Response)
+			return
+		}
+
+		// Cache miss — call upstream
 		resp, provider, err := rtr.Complete(&req)
 		latency := time.Since(start).Seconds()
 
@@ -105,6 +145,9 @@ func main() {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
+
+		// Store in cache for next time
+		cacheLayer.Set(r.Context(), &req, resp)
 
 		observability.RequestsTotal.WithLabelValues(req.Model, provider, "200").Inc()
 		observability.RequestDuration.WithLabelValues(req.Model, provider).Observe(latency)
@@ -121,6 +164,7 @@ func main() {
 		)
 
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Cache", "miss")
 		json.NewEncoder(w).Encode(resp)
 	})))
 
