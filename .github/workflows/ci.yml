@@ -36,8 +36,12 @@ jobs:
         run: docker compose up -d --wait
 
       - name: Health check
+        env:
+          GATEWAY_API_KEY: test-key
+          OPENAI_API_KEY: test-key
         run: |
-          go build -o /tmp/proxy ./proxy/cmd/proxy &
+          go build -o /tmp/proxy ./proxy/cmd/proxy
+          /tmp/proxy &
           sleep 2
           curl -sf http://localhost:8080/health
 
